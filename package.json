@@ -1,0 +1,30 @@
+{
+  "name": "historical-idl",
+  "version": "0.1.0",
+  "description": "Reconstruct historical IDL versions from on-chain Solana transactions",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "historical-idl": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@solana-program/program-metadata": "^0.5.1",
+    "@solana/kit": "^6.0.0",
+    "commander": "^13.0.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

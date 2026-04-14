@@ -6,7 +6,6 @@ const nextConfig: NextConfig = {
   experimental: {
     externalDir: true,
   },
-  serverExternalPackages: ['@solana/kit', '@solana-program/program-metadata'],
   webpack(config) {
     // The core library uses .js extensions in imports (NodeNext resolution).
     // Map .js -> .ts so the bundler can find them.

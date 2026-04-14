@@ -4,3 +4,5 @@ idls/
 idls-anchor/
 idls-both/
 *.tsbuildinfo
+.env.local
+.next/

@@ -17,6 +17,12 @@ const nextConfig: NextConfig = {
       ...config.resolve.alias,
       '@core': path.resolve(__dirname, '../src'),
     };
+    // Ensure imports from ../src/ can resolve packages from web/node_modules
+    // (on Vercel only web/node_modules is installed, not root node_modules)
+    config.resolve.modules = [
+      path.resolve(__dirname, 'node_modules'),
+      ...(config.resolve.modules ?? ['node_modules']),
+    ];
     return config;
   },
 };

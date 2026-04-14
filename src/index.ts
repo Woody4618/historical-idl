@@ -1,5 +1,5 @@
 export {
-    reconstructHistory,
+    reconstructPmpHistory,
     findPmpMetadataPda,
     Compression,
     Encoding,
@@ -10,4 +10,11 @@ export {
     DISC_LABEL,
 } from './program-metadata.js';
 
-export type { Snapshot, VirtualState, Seed } from './program-metadata.js';
+export type { VirtualState } from './program-metadata.js';
+
+export {
+    reconstructAnchorHistory,
+    findAnchorIdlAddress,
+} from './anchor.js';
+
+export type { Snapshot } from './rpc.js';

@@ -12,9 +12,14 @@ import {
     ENCODING_NAME,
     FORMAT_NAME,
     findPmpMetadataPda,
-    reconstructHistory,
-    type Snapshot,
+    reconstructPmpHistory,
+    type VirtualState,
 } from './program-metadata.js';
+import {
+    findAnchorIdlAddress,
+    reconstructAnchorHistory,
+} from './anchor.js';
+import type { Snapshot } from './rpc.js';
 
 // ─── Display ─────────────────────────────────────────────────────────────────
 
@@ -23,9 +28,17 @@ function fmtTime(blockTime: bigint | null): string {
     return new Date(Number(blockTime) * 1000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
-function displaySnapshots(snapshots: Snapshot[]): void {
+function isPmpState(state: unknown): state is VirtualState {
+    return (
+        state !== null &&
+        typeof state === 'object' &&
+        'discriminator' in (state as Record<string, unknown>)
+    );
+}
+
+function displaySnapshots(snapshots: Snapshot[], idlType: string): void {
     const count = snapshots.length;
-    console.log(pc.bold(`Found ${count} state change${count === 1 ? '' : 's'}:\n`));
+    console.log(pc.bold(`Found ${count} state change${count === 1 ? '' : 's'} (${idlType}):\n`));
 
     for (const snap of snapshots) {
         const slot = pc.cyan(snap.slot.toString().padStart(14));
@@ -40,23 +53,29 @@ function displaySnapshots(snapshots: Snapshot[]): void {
             continue;
         }
 
-        const { state } = snap;
-        const discLabel = DISC_LABEL[state.discriminator] ?? 'Unknown';
         let dataInfo: string;
 
-        if (state.discriminator === 2) {
-            const fmt = FORMAT_NAME[state.format] ?? `fmt(${state.format})`;
-            const enc = ENCODING_NAME[state.encoding] ?? `enc(${state.encoding})`;
-            const cmp = COMPRESSION_NAME[state.compression] ?? `cmp(${state.compression})`;
-            const mutable = state.mutable ? '' : pc.red(' immutable');
-            dataInfo =
-                pc.green(`${state.dataLength} bytes`) +
-                `  ${fmt}/${enc}/${cmp}${mutable}`;
+        if (isPmpState(snap.state)) {
+            const state = snap.state;
+            const discLabel = DISC_LABEL[state.discriminator] ?? 'Unknown';
+
+            if (state.discriminator === 2) {
+                const fmt = FORMAT_NAME[state.format] ?? `fmt(${state.format})`;
+                const enc = ENCODING_NAME[state.encoding] ?? `enc(${state.encoding})`;
+                const cmp = COMPRESSION_NAME[state.compression] ?? `cmp(${state.compression})`;
+                const mutable = state.mutable ? '' : pc.red(' immutable');
+                dataInfo =
+                    pc.green(`${state.dataLength} bytes`) +
+                    `  ${fmt}/${enc}/${cmp}${mutable}`;
+            } else {
+                dataInfo = pc.dim(
+                    discLabel +
+                        (state.data.length > 0 ? `  ${state.data.length} bytes buffered` : ''),
+                );
+            }
         } else {
-            dataInfo = pc.dim(
-                discLabel +
-                    (state.data.length > 0 ? `  ${state.data.length} bytes buffered` : ''),
-            );
+            const anchorState = snap.state as { data: Uint8Array; writeOffset: number };
+            dataInfo = pc.green(`${anchorState.data.length} bytes`) + '  zlib/utf8';
         }
 
         console.log(`${slot}  ${time}  ${instr}  ${dataInfo}`);
@@ -67,7 +86,7 @@ function displaySnapshots(snapshots: Snapshot[]): void {
         if (snap.decodedContent !== null) {
             const preview =
                 snap.decodedContent.length > 140
-                    ? snap.decodedContent.slice(0, 140) + pc.dim('…')
+                    ? snap.decodedContent.slice(0, 140) + pc.dim('...')
                     : snap.decodedContent;
             console.log(
                 `               ${' '.repeat(21)} ${pc.dim('↳')} ${preview}`,
@@ -87,32 +106,41 @@ function saveSnapshots(snapshots: Snapshot[], outDir: string): void {
         const filename = `${snap.slot}_${snap.instruction.toLowerCase()}.json`;
         const filepath = path.join(outDir, filename);
 
+        let stateObj: Record<string, unknown> | null = null;
+
+        if (snap.state && isPmpState(snap.state)) {
+            const state = snap.state;
+            stateObj = {
+                discriminator: state.discriminator,
+                authority: state.authority,
+                mutable: state.mutable,
+                canonical: state.canonical,
+                seed: Buffer.from(state.seed).toString('hex'),
+                encoding: ENCODING_NAME[state.encoding] ?? state.encoding,
+                compression: COMPRESSION_NAME[state.compression] ?? state.compression,
+                format: FORMAT_NAME[state.format] ?? state.format,
+                dataSource: state.dataSource,
+                dataLength: state.dataLength,
+                data: Buffer.from(
+                    state.data.slice(0, state.dataLength),
+                ).toString('base64'),
+            };
+        } else if (snap.state) {
+            const s = snap.state as { data: Uint8Array; writeOffset: number; authority: string | null };
+            stateObj = {
+                authority: s.authority,
+                writeOffset: s.writeOffset,
+                dataLength: s.data.length,
+                data: Buffer.from(s.data).toString('base64'),
+            };
+        }
+
         const serialisable = {
             slot: snap.slot.toString(),
             blockTime: snap.blockTime !== null ? Number(snap.blockTime) : null,
             signature: snap.signature,
             instruction: snap.instruction,
-            state: snap.state
-                ? {
-                      discriminator: snap.state.discriminator,
-                      authority: snap.state.authority,
-                      mutable: snap.state.mutable,
-                      canonical: snap.state.canonical,
-                      seed: Buffer.from(snap.state.seed).toString('hex'),
-                      encoding:
-                          ENCODING_NAME[snap.state.encoding] ?? snap.state.encoding,
-                      compression:
-                          COMPRESSION_NAME[snap.state.compression] ??
-                          snap.state.compression,
-                      format:
-                          FORMAT_NAME[snap.state.format] ?? snap.state.format,
-                      dataSource: snap.state.dataSource,
-                      dataLength: snap.state.dataLength,
-                      data: Buffer.from(
-                          snap.state.data.slice(0, snap.state.dataLength),
-                      ).toString('base64'),
-                  }
-                : null,
+            state: stateObj,
             decodedContent: snap.decodedContent,
         };
 
@@ -130,7 +158,6 @@ type IdlVersion = {
 function dumpDistinctIdls(snapshots: Snapshot[], outDir: string): number {
     fs.mkdirSync(outDir, { recursive: true });
 
-    // Collect distinct IDL versions with their activation slots.
     const versions: {
         content: string;
         version: string | null;
@@ -163,13 +190,9 @@ function dumpDistinctIdls(snapshots: Snapshot[], outDir: string): number {
         });
     }
 
-    // Find the last slot that touched the account (for the "activeTo" of the
-    // latest version — might be a re-upload or SetImmutable after the last
-    // content change).
     const lastSnap = snapshots[snapshots.length - 1];
     const isClosed = lastSnap && !lastSnap.state;
 
-    // Write each distinct IDL file and build the index.
     const index: IdlVersion[] = [];
     for (let i = 0; i < versions.length; i++) {
         const v = versions[i];
@@ -197,7 +220,6 @@ function dumpDistinctIdls(snapshots: Snapshot[], outDir: string): number {
         JSON.stringify(index, null, 2),
     );
 
-    // Print timeline summary.
     if (versions.length > 0) {
         console.log(pc.bold(`\nIDL version timeline:\n`));
         for (let i = 0; i < index.length; i++) {
@@ -227,6 +249,111 @@ function fmtTimeIso(blockTime: bigint | null): string | null {
     return new Date(Number(blockTime) * 1000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// ─── Auto-detection ──────────────────────────────────────────────────────────
+
+async function countSigs(rpc: ReturnType<typeof createSolanaRpc>, addr: Address): Promise<number> {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const sigs = await (rpc as any)
+            .getSignaturesForAddress(addr, { limit: 1 })
+            .send();
+        return sigs?.length ?? 0;
+    } catch {
+        return 0;
+    }
+}
+
+/**
+ * Check both Anchor IDL and PMP metadata PDAs for transaction history.
+ * Prefer Anchor if the Anchor IDL address has activity, since PMP PDAs
+ * can coincidentally receive unrelated transactions.
+ */
+async function detectIdlType(
+    rpc: ReturnType<typeof createSolanaRpc>,
+    programAddress: Address,
+    seed: string,
+    authority?: Address,
+): Promise<'pmp' | 'anchor'> {
+    const [anchorAddr, pmpAddr] = await Promise.all([
+        findAnchorIdlAddress(programAddress),
+        findPmpMetadataPda(programAddress, seed, authority),
+    ]);
+
+    const [anchorCount, pmpCount] = await Promise.all([
+        countSigs(rpc, anchorAddr),
+        countSigs(rpc, pmpAddr),
+    ]);
+
+    if (anchorCount > 0 && pmpCount > 0) {
+        return 'anchor';
+    }
+    if (pmpCount > 0) return 'pmp';
+    return 'anchor';
+}
+
+// ─── Single-type run ─────────────────────────────────────────────────────────
+
+async function runSingle(
+    rpc: ReturnType<typeof createSolanaRpc>,
+    rpcUrl: string,
+    addr: Address,
+    idlType: 'pmp' | 'anchor',
+    seed: string,
+    authority: Address | undefined,
+    outputDir: string | undefined,
+    dumpDir: string | undefined,
+): Promise<void> {
+    let targetAddr: string;
+    if (idlType === 'pmp') {
+        targetAddr = await findPmpMetadataPda(addr, seed, authority);
+    } else {
+        targetAddr = await findAnchorIdlAddress(addr);
+    }
+
+    console.log(pc.bold(`Reconstructing ${idlType.toUpperCase()} IDL history...\n`));
+    console.log(`  ${pc.dim('program:')}    ${addr}`);
+    if (idlType === 'pmp') {
+        console.log(`  ${pc.dim('seed:')}       ${seed}`);
+        if (authority) console.log(`  ${pc.dim('authority:')}  ${authority}`);
+    }
+    console.log(`  ${pc.dim('idl acct:')}   ${targetAddr}`);
+    console.log(`  ${pc.dim('rpc:')}        ${rpcUrl}`);
+    console.log();
+
+    let snapshots: Snapshot[];
+    try {
+        if (idlType === 'pmp') {
+            snapshots = await reconstructPmpHistory(rpc, targetAddr as Address);
+        } else {
+            snapshots = await reconstructAnchorHistory(rpc, addr);
+        }
+    } catch (err) {
+        console.error(pc.red(`[${idlType.toUpperCase()}] ${(err as Error).message ?? String(err)}`));
+        return;
+    }
+
+    if (snapshots.length === 0) {
+        console.log(pc.yellow(`No ${idlType.toUpperCase()} transactions found for this program.`));
+        return;
+    }
+
+    displaySnapshots(snapshots, idlType.toUpperCase());
+
+    if (outputDir) {
+        saveSnapshots(snapshots, outputDir);
+        console.log(
+            pc.green(`Saved ${snapshots.length} snapshot(s) to ${pc.bold(outputDir)}`),
+        );
+    }
+
+    if (dumpDir) {
+        const written = dumpDistinctIdls(snapshots, dumpDir);
+        console.log(
+            pc.green(`Wrote ${written} distinct IDL version(s) to ${pc.bold(dumpDir)}`),
+        );
+    }
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 const program = new Command()
@@ -235,8 +362,9 @@ const program = new Command()
     .version('0.1.0')
     .argument('<program-address>', 'Program address to look up IDL history for')
     .option('-r, --rpc <url>', 'Solana RPC URL (or set RPC_URL env var)')
-    .option('-s, --seed <seed>', 'Metadata seed', 'idl')
-    .option('-a, --authority <address>', 'Authority address (for non-canonical metadata)')
+    .option('-t, --type <type>', 'IDL type: "pmp", "anchor", or "both" (auto-detected if omitted)')
+    .option('-s, --seed <seed>', 'Metadata seed (PMP only)', 'idl')
+    .option('-a, --authority <address>', 'Authority address (for non-canonical PMP metadata)')
     .option('-o, --output <dir>', 'Directory to save full snapshots')
     .option('--dump-idls <dir>', 'Directory to write each distinct IDL version')
     .action(async (programAddress: string, opts) => {
@@ -255,47 +383,30 @@ const program = new Command()
             ? (opts.authority as Address)
             : undefined;
 
-        const metadataAddr = await findPmpMetadataPda(addr, seed, authority);
+        let typeArg: string = opts.type ?? 'auto';
 
-        console.log(pc.bold('Reconstructing metadata history...\n'));
-        console.log(`  ${pc.dim('program:')}    ${addr}`);
-        console.log(`  ${pc.dim('seed:')}       ${seed}`);
-        if (authority) console.log(`  ${pc.dim('authority:')}  ${authority}`);
-        console.log(`  ${pc.dim('metadata:')}   ${metadataAddr}`);
-        console.log(`  ${pc.dim('rpc:')}        ${rpcUrl}`);
-        console.log();
-
-        let snapshots: Snapshot[];
-        try {
-            snapshots = await reconstructHistory(rpc, metadataAddr);
-        } catch (err) {
-            console.error(pc.red((err as Error).message ?? String(err)));
-            process.exit(1);
+        if (typeArg === 'auto') {
+            console.log(pc.dim('Auto-detecting IDL type...'));
+            typeArg = await detectIdlType(rpc, addr, seed, authority);
+            console.log(pc.dim(`Detected: ${typeArg}\n`));
         }
 
-        if (snapshots.length === 0) {
-            console.log(pc.yellow('No transactions found for this metadata account.'));
-            return;
-        }
+        const types: Array<'pmp' | 'anchor'> =
+            typeArg === 'both' ? ['pmp', 'anchor'] : [typeArg as 'pmp' | 'anchor'];
 
-        displaySnapshots(snapshots);
+        for (const t of types) {
+            const outDir = opts.output
+                ? types.length > 1 ? path.join(opts.output, t) : opts.output
+                : undefined;
+            const dumpDir = opts.dumpIdls
+                ? types.length > 1 ? path.join(opts.dumpIdls, t) : opts.dumpIdls
+                : undefined;
 
-        if (opts.output) {
-            saveSnapshots(snapshots, opts.output);
-            console.log(
-                pc.green(
-                    `Saved ${snapshots.length} snapshot(s) to ${pc.bold(opts.output)}`,
-                ),
-            );
-        }
+            await runSingle(rpc, rpcUrl, addr, t, seed, authority, outDir, dumpDir);
 
-        if (opts.dumpIdls) {
-            const written = dumpDistinctIdls(snapshots, opts.dumpIdls);
-            console.log(
-                pc.green(
-                    `Wrote ${written} distinct IDL version(s) to ${pc.bold(opts.dumpIdls)}`,
-                ),
-            );
+            if (types.length > 1 && t !== types[types.length - 1]) {
+                console.log(pc.dim('─'.repeat(60) + '\n'));
+            }
         }
     });
 

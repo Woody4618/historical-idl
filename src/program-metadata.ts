@@ -1,7 +1,5 @@
 import {
     Address,
-    getBase58Decoder,
-    getBase58Encoder,
     Rpc,
     SolanaRpcApi,
 } from '@solana/kit';
@@ -13,6 +11,20 @@ import {
     type Seed,
     unpackDirectData as pmpUnpackDirectData,
 } from '@solana-program/program-metadata';
+
+import {
+    fromBase58,
+    readU32LE,
+    rawBytesToAddress,
+    writeChunk,
+    resolveAccountKeys,
+    flattenInstructions,
+    fetchAllSignatures,
+    fetchTx,
+    type Snapshot,
+    type ParsedTx,
+    type CompiledInstruction,
+} from './rpc.js';
 
 // ─── Re-exports from PMP package ─────────────────────────────────────────────
 
@@ -59,52 +71,6 @@ export type VirtualState = {
     data: Uint8Array<ArrayBuffer>;
 };
 
-export type Snapshot = {
-    slot: bigint;
-    blockTime: bigint | null;
-    signature: string;
-    instruction: string;
-    state: VirtualState | null;
-    decodedContent: string | null;
-};
-
-type SigInfo = {
-    signature: string;
-    slot: bigint;
-    blockTime: bigint | null;
-    err: unknown;
-};
-
-type CompiledInstruction = {
-    programIdIndex: number;
-    accounts: number[];
-    data: string;
-};
-
-type InnerInstructionGroup = {
-    index: number;
-    instructions: CompiledInstruction[];
-};
-
-type ParsedTx = {
-    slot: bigint;
-    blockTime: bigint | null;
-    transaction: {
-        message: {
-            accountKeys: string[];
-            instructions: CompiledInstruction[];
-        };
-    };
-    meta: {
-        err: unknown;
-        innerInstructions?: InnerInstructionGroup[] | null;
-        loadedAddresses?: {
-            writable?: string[];
-            readonly?: string[];
-        } | null;
-    } | null;
-};
-
 // ─── PDA derivation ──────────────────────────────────────────────────────────
 
 export async function findPmpMetadataPda(
@@ -120,45 +86,7 @@ export async function findPmpMetadataPda(
     return pda;
 }
 
-// ─── Low-level helpers ───────────────────────────────────────────────────────
-
-function fromBase58(b58: string): Uint8Array<ArrayBuffer> {
-    try {
-        return new Uint8Array(getBase58Encoder().encode(b58));
-    } catch {
-        return new Uint8Array(0);
-    }
-}
-
-function readU32LE(bytes: Uint8Array, offset: number): number {
-    return (
-        (bytes[offset] |
-            (bytes[offset + 1] << 8) |
-            (bytes[offset + 2] << 16) |
-            ((bytes[offset + 3] << 24) >>> 0)) >>>
-        0
-    );
-}
-
-function rawBytesToAddress(bytes: Uint8Array<ArrayBuffer>, offset: number): Address {
-    const slice = bytes.slice(offset, offset + 32);
-    return getBase58Decoder().decode(slice) as Address;
-}
-
-function writeChunk(
-    buf: Uint8Array<ArrayBuffer>,
-    chunk: Uint8Array<ArrayBuffer>,
-    dstOffset: number,
-): Uint8Array<ArrayBuffer> {
-    const needed = dstOffset + chunk.length;
-    if (needed > buf.length) {
-        const grown = new Uint8Array(needed);
-        grown.set(buf);
-        buf = grown;
-    }
-    buf.set(chunk, dstOffset);
-    return buf;
-}
+// ─── Internal helpers ────────────────────────────────────────────────────────
 
 function cloneState(s: VirtualState): VirtualState {
     return {
@@ -174,91 +102,6 @@ function emptyState(): VirtualState {
         seed: new Uint8Array(16), encoding: 0, compression: 0, format: 0,
         dataSource: 0, dataLength: 0, data: new Uint8Array(0),
     };
-}
-
-function resolveAccountKeys(tx: ParsedTx): string[] {
-    const keys = [...tx.transaction.message.accountKeys];
-    const loaded = tx.meta?.loadedAddresses;
-    if (loaded) {
-        keys.push(...(loaded.writable ?? []));
-        keys.push(...(loaded.readonly ?? []));
-    }
-    return keys;
-}
-
-function flattenInstructions(tx: ParsedTx): CompiledInstruction[] {
-    const result: CompiledInstruction[] = [];
-    const innerByOuterIdx = new Map<number, CompiledInstruction[]>();
-
-    for (const group of tx.meta?.innerInstructions ?? []) {
-        innerByOuterIdx.set(group.index, group.instructions);
-    }
-
-    tx.transaction.message.instructions.forEach((outerIx, idx) => {
-        result.push(outerIx);
-        const inner = innerByOuterIdx.get(idx);
-        if (inner) result.push(...inner);
-    });
-
-    return result;
-}
-
-// ─── RPC helpers with retry ──────────────────────────────────────────────────
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            return await fn();
-        } catch (err: unknown) {
-            lastErr = err;
-            const is429 =
-                err instanceof Error &&
-                (err.message.includes('429') || err.message.includes('Too Many Requests'));
-            if (!is429 || attempt === maxRetries) throw err;
-            const backoff = Math.min(1000 * 2 ** attempt, 15_000);
-            await sleep(backoff);
-        }
-    }
-    throw lastErr;
-}
-
-async function fetchAllSignatures(rpc: Rpc<SolanaRpcApi>, addr: Address): Promise<SigInfo[]> {
-    const all: SigInfo[] = [];
-    let before: string | undefined;
-
-    for (;;) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const batch = await withRetry(async () =>
-            (await (rpc as any)
-                .getSignaturesForAddress(addr, {
-                    limit: 1000,
-                    ...(before ? { before } : {}),
-                })
-                .send()) as SigInfo[],
-        );
-
-        if (!batch || batch.length === 0) break;
-        all.push(...batch);
-        before = batch[batch.length - 1].signature;
-        if (batch.length < 1000) break;
-    }
-
-    return all.reverse();
-}
-
-async function fetchTx(rpc: Rpc<SolanaRpcApi>, sig: string): Promise<ParsedTx | null> {
-    return withRetry(async () =>
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (rpc as any)
-            .getTransaction(sig, {
-                maxSupportedTransactionVersion: 0,
-                encoding: 'json',
-            })
-            .send() as Promise<ParsedTx | null>,
-    );
 }
 
 // ─── Buffer reconstruction ───────────────────────────────────────────────────
@@ -443,7 +286,7 @@ function tryDecode(state: VirtualState): string | null {
 
 // ─── History reconstruction ──────────────────────────────────────────────────
 
-export async function reconstructHistory(
+export async function reconstructPmpHistory(
     rpc: Rpc<SolanaRpcApi>,
     metadataAddr: Address,
 ): Promise<Snapshot[]> {

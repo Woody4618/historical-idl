@@ -74,6 +74,22 @@ npm run dev                   # http://localhost:3000
 
 Deploy to Vercel by setting the root directory to `web` and adding `RPC_URL` as an environment variable.
 
+### API Endpoints
+
+**`GET /api/idl?programId=<address>`** -- Returns the current IDL for a program. Checks PMP first, falls back to Anchor.
+
+```json
+{
+  "programId": "BUYux...",
+  "type": "pmp",
+  "idl": { ... }
+}
+```
+
+Returns `404` if no IDL is found for either format.
+
+**`POST /api/history`** -- Reconstructs the full IDL version history (all past versions with slot ranges). Send `{ "programId": "..." }` as JSON body.
+
 ## Library Usage
 
 The core reconstruction logic can also be used as a library:

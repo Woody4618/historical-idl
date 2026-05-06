@@ -2,6 +2,9 @@
 
 Reconstruct the full version history of Solana program IDLs from on-chain transactions. Supports both **Anchor IDL** and **Program Metadata (PMP)** formats.
 
+The app and api is also live for mainnet here: 
+https://idl-explorer.vercel.app/ 
+
 ## Setup
 
 ```bash

@@ -1,0 +1,95 @@
+# Upload or update an IDL on the Solana Program Metadata Program (PMP).
+#
+# Manual run: Actions → "Upload IDL to Program Metadata" → Run workflow.
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   PMP_UPLOAD_KEYPAIR — full Solana keypair JSON array (same format as ~/.config/solana/id.json).
+#                        This wallet signs as authority; it also pays fees unless you set PAYER_KEYPAIR.
+#   RPC_URL            — HTTPS RPC endpoint (must allow sendTransaction).
+#
+# Optional secrets:
+#   PAYER_KEYPAIR      — if set, this keypair pays rent and fees while PMP_UPLOAD_KEYPAIR remains authority.
+#
+# Native programs and other cases without BPF upgrade authority require non-canonical metadata
+# (authority = your keypair). Set workflow input `non_canonical` to true (default).
+#
+# For programs you deploy, set `non_canonical` to false and use the program upgrade authority keypair.
+
+name: Upload IDL to Program Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      program_id:
+        description: Program address (base58) this IDL describes
+        required: true
+        type: string
+      idl_url:
+        description: HTTPS URL to the IDL JSON (e.g. raw.githubusercontent.com/.../idl.json)
+        required: true
+        type: string
+      non_canonical:
+        description: Use non-canonical PMP account (required for native programs and third-party uploads)
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and validate IDL
+        env:
+          IDL_URL: ${{ inputs.idl_url }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "$IDL_URL" -o idl.json
+          node -e "JSON.parse(require('fs').readFileSync('idl.json','utf8')); console.log('IDL JSON ok')"
+
+      - name: Write signing keypair
+        env:
+          PMP_UPLOAD_KEYPAIR: ${{ secrets.PMP_UPLOAD_KEYPAIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PMP_UPLOAD_KEYPAIR:-}" ]; then
+            echo "Missing secret PMP_UPLOAD_KEYPAIR"
+            exit 1
+          fi
+          printf '%s' "$PMP_UPLOAD_KEYPAIR" > upload-keypair.json
+          node -e "JSON.parse(require('fs').readFileSync('upload-keypair.json','utf8')); console.log('Keypair JSON ok')"
+
+      - name: Optional payer keypair
+        env:
+          PAYER_KEYPAIR: ${{ secrets.PAYER_KEYPAIR }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PAYER_KEYPAIR:-}" ]; then
+            printf '%s' "$PAYER_KEYPAIR" > payer-keypair.json
+            node -e "JSON.parse(require('fs').readFileSync('payer-keypair.json','utf8')); console.log('Payer keypair ok')"
+          fi
+
+      - name: Upload IDL via program-metadata CLI
+        env:
+          RPC_URL: ${{ secrets.RPC_URL }}
+          PROGRAM_ID: ${{ inputs.program_id }}
+          NON_CANONICAL: ${{ inputs.non_canonical }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RPC_URL:-}" ]; then
+            echo "Missing secret RPC_URL"
+            exit 1
+          fi
+          EXTRA=( )
+          case "${NON_CANONICAL}" in true|True) EXTRA+=( --non-canonical ) ;; esac
+          if [ -f payer-keypair.json ]; then
+            EXTRA+=( -p payer-keypair.json )
+          fi
+          npx --yes @solana-program/program-metadata@0.5.1 write idl "$PROGRAM_ID" idl.json \
+            -k upload-keypair.json \
+            --rpc "$RPC_URL" \
+            "${EXTRA[@]}"
+
+      - name: Remove key material
+        if: always()
+        run: |
+          rm -f upload-keypair.json payer-keypair.json idl.json

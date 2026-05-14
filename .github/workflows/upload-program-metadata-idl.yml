@@ -5,7 +5,10 @@
 # Repository secrets (Settings → Secrets and variables → Actions):
 #   PMP_UPLOAD_KEYPAIR — full Solana keypair JSON array (same format as ~/.config/solana/id.json).
 #                        This wallet signs as authority; it also pays fees unless you set PAYER_KEYPAIR.
-#   RPC_URL            — HTTPS RPC endpoint (must allow sendTransaction).
+#   RPC_URL_MAINNET    — HTTPS RPC for mainnet-beta (workflow input "cluster").
+#   RPC_URL_TESTNET    — HTTPS RPC for testnet.
+#   RPC_URL_DEVNET     — HTTPS RPC for devnet.
+#   RPC_URL            — optional legacy fallback if the cluster-specific secret for the chosen cluster is empty.
 #
 # Optional secrets:
 #   PAYER_KEYPAIR      — if set, this keypair pays rent and fees while PMP_UPLOAD_KEYPAIR remains authority.
@@ -28,6 +31,15 @@ on:
         description: HTTPS URL to the IDL JSON (e.g. raw.githubusercontent.com/.../idl.json)
         required: true
         type: string
+      cluster:
+        description: Solana cluster (selects which RPC_* secret is used)
+        required: true
+        type: choice
+        options:
+          - mainnet-beta
+          - testnet
+          - devnet
+        default: mainnet-beta
       non_canonical:
         description: Use non-canonical PMP account (required for native programs and third-party uploads)
         required: true
@@ -70,15 +82,29 @@ jobs:
 
       - name: Upload IDL via program-metadata CLI
         env:
-          RPC_URL: ${{ secrets.RPC_URL }}
+          CLUSTER: ${{ inputs.cluster }}
+          RPC_URL_MAINNET: ${{ secrets.RPC_URL_MAINNET }}
+          RPC_URL_TESTNET: ${{ secrets.RPC_URL_TESTNET }}
+          RPC_URL_DEVNET: ${{ secrets.RPC_URL_DEVNET }}
+          RPC_URL_FALLBACK: ${{ secrets.RPC_URL }}
           PROGRAM_ID: ${{ inputs.program_id }}
           NON_CANONICAL: ${{ inputs.non_canonical }}
         run: |
           set -euo pipefail
+          case "${CLUSTER}" in
+            mainnet-beta) RPC_URL="${RPC_URL_MAINNET:-${RPC_URL_FALLBACK:-}}" ;;
+            testnet)      RPC_URL="${RPC_URL_TESTNET:-${RPC_URL_FALLBACK:-}}" ;;
+            devnet)       RPC_URL="${RPC_URL_DEVNET:-${RPC_URL_FALLBACK:-}}" ;;
+            *)
+              echo "Unknown cluster: ${CLUSTER}"
+              exit 1
+              ;;
+          esac
           if [ -z "${RPC_URL:-}" ]; then
-            echo "Missing secret RPC_URL"
+            echo "No RPC URL for cluster ${CLUSTER}. Set secret RPC_URL_MAINNET, RPC_URL_TESTNET, or RPC_URL_DEVNET (or legacy RPC_URL)."
             exit 1
           fi
+          echo "Using RPC for cluster: ${CLUSTER}"
           EXTRA=( )
           case "${NON_CANONICAL}" in true|True) EXTRA+=( --non-canonical ) ;; esac
           if [ -f payer-keypair.json ]; then

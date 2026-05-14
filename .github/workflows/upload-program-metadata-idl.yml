@@ -28,7 +28,10 @@ on:
         required: true
         type: string
       idl_url:
-        description: HTTPS URL to the IDL JSON (e.g. raw.githubusercontent.com/.../idl.json)
+        description: >-
+          Direct HTTPS URL to raw JSON (must not be an HTML page). Prefer
+          https://raw.githubusercontent.com/owner/repo/ref/path/idl.json — blob
+          links on github.com are rewritten automatically when possible.
         required: true
         type: string
       cluster:
@@ -55,8 +58,25 @@ jobs:
           IDL_URL: ${{ inputs.idl_url }}
         run: |
           set -euo pipefail
-          curl -fsSL "$IDL_URL" -o idl.json
-          node -e "JSON.parse(require('fs').readFileSync('idl.json','utf8')); console.log('IDL JSON ok')"
+          url="$IDL_URL"
+          # github.com/.../blob/... -> raw.githubusercontent.com (avoids HTML file viewer)
+          if [[ "$url" =~ ^https://(www\.)?github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$ ]]; then
+            path="${BASH_REMATCH[5]%%\?*}"
+            url="https://raw.githubusercontent.com/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}/${BASH_REMATCH[4]}/${path}"
+            echo "Using raw URL: $url"
+          fi
+          curl -fsSL "$url" -o idl.json
+          node -e "
+            const fs = require('fs');
+            const s = fs.readFileSync('idl.json', 'utf8');
+            let t = s.trimStart();
+            if (t.charCodeAt(0) === 0xfeff) t = t.slice(1);
+            if (!t.startsWith('{') && !t.startsWith('[')) {
+              console.error('idl_url did not return JSON (likely an HTML page). Use a raw URL, e.g. https://raw.githubusercontent.com/<org>/<repo>/<ref>/<path>.json');
+              process.exit(1);
+            }
+            JSON.parse(s);
+          "
 
       - name: Write signing keypair
         env:
@@ -68,7 +88,19 @@ jobs:
             exit 1
           fi
           printf '%s' "$PMP_UPLOAD_KEYPAIR" > upload-keypair.json
-          node -e "JSON.parse(require('fs').readFileSync('upload-keypair.json','utf8')); console.log('Keypair JSON ok')"
+          node -e "
+            const fs = require('fs');
+            const s = fs.readFileSync('upload-keypair.json', 'utf8').trim();
+            let data;
+            try { data = JSON.parse(s); } catch {
+              console.error('PMP_UPLOAD_KEYPAIR is not valid JSON (wrong secret or HTML pasted). Use the full id.json array.');
+              process.exit(1);
+            }
+            if (!Array.isArray(data) || data.length < 64) {
+              console.error('PMP_UPLOAD_KEYPAIR must be a JSON array of 64 numbers (Solana keypair file).');
+              process.exit(1);
+            }
+          "
 
       - name: Optional payer keypair
         env:
@@ -77,7 +109,19 @@ jobs:
           set -euo pipefail
           if [ -n "${PAYER_KEYPAIR:-}" ]; then
             printf '%s' "$PAYER_KEYPAIR" > payer-keypair.json
-            node -e "JSON.parse(require('fs').readFileSync('payer-keypair.json','utf8')); console.log('Payer keypair ok')"
+            node -e "
+              const fs = require('fs');
+              const s = fs.readFileSync('payer-keypair.json', 'utf8').trim();
+              let data;
+              try { data = JSON.parse(s); } catch {
+                console.error('PAYER_KEYPAIR is not valid JSON.');
+                process.exit(1);
+              }
+              if (!Array.isArray(data) || data.length < 64) {
+                console.error('PAYER_KEYPAIR must be a JSON array of 64 numbers.');
+                process.exit(1);
+              }
+            "
           fi
 
       - name: Upload IDL via program-metadata CLI
